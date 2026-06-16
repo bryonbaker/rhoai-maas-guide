@@ -70,6 +70,7 @@ Automate RHOAI MaaS installation following the official guide.
 Options:
   --from-phase N    Start execution from phase N (default: 0)
   --to-phase M      Run up to and including phase M (default: 4)
+  --include-gpus    Install GPU operators (NFD and NVIDIA) in Phase 1
   -h, --help        Display this help message
 
 Phases:
@@ -102,6 +103,12 @@ Examples:
   export METALLB_IP_RANGE='192.168.1.240-192.168.1.250'
   ./scripts/setup-2.sh --from-phase 1 --to-phase 1
 
+  # Install complete MaaS platform with GPU support
+  ./scripts/setup-2.sh --include-gpus
+
+  # Run only Phase 1 with GPU operators
+  ./scripts/setup-2.sh --from-phase 1 --to-phase 1 --include-gpus
+
 Environment Variables:
   METALLB_IP_RANGE  IP range for MetalLB pool (format: <start-ip>-<end-ip>)
                     Required for multi-node non-cloud clusters
@@ -117,6 +124,7 @@ EOF
 FROM_PHASE=0
 TO_PHASE=4
 SHOW_HELP=false
+INCLUDE_GPUS=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -127,6 +135,10 @@ while [[ $# -gt 0 ]]; do
         --to-phase)
             TO_PHASE="$2"
             shift 2
+            ;;
+        --include-gpus)
+            INCLUDE_GPUS=true
+            shift
             ;;
         -h|--help)
             SHOW_HELP=true
@@ -312,6 +324,121 @@ if should_run 1; then
 
     log_info "All required operator CSVs ready"
 
+    # Step 2b: GPU Operators (Optional)
+    if [ "$INCLUDE_GPUS" = true ]; then
+        log_step "Installing GPU operators (Node Feature Discovery and NVIDIA)..."
+
+        # Install operators via subscriptions
+        log_info "Applying GPU operator subscriptions..."
+        oc apply -k "$MANIFESTS_DIR/01-prerequisites/gpu/"
+        log_info "GPU operator subscriptions applied"
+
+        # Wait for operator CSVs
+        log_info "Waiting for Node Feature Discovery operator CSV..."
+        wait_for_csv "openshift-nfd" "operators.coreos.com/nfd.openshift-nfd" "Node Feature Discovery operator" 600
+
+        log_info "Waiting for NVIDIA GPU operator CSV..."
+        wait_for_csv "nvidia-gpu-operator" "operators.coreos.com/gpu-operator-certified.nvidia-gpu-operator" "NVIDIA GPU operator" 600
+
+        log_info "GPU operator CSVs are ready"
+
+        # Wait for CRDs to be available
+        log_info "Waiting for NFD CRD to be available..."
+        timeout=120
+        elapsed=0
+        while [ $elapsed -lt $timeout ]; do
+            if oc get crd nodefeaturediscoveries.nfd.openshift.io &>/dev/null; then
+                log_info "NFD CRD is ready"
+                break
+            fi
+            sleep 2
+            elapsed=$((elapsed + 2))
+        done
+
+        if [ $elapsed -ge $timeout ]; then
+            log_error "NFD CRD not available after ${timeout}s"
+            exit 1
+        fi
+
+        log_info "Waiting for NVIDIA GPU CRD to be available..."
+        timeout=120
+        elapsed=0
+        while [ $elapsed -lt $timeout ]; do
+            if oc get crd clusterpolicies.nvidia.com &>/dev/null; then
+                log_info "NVIDIA GPU CRD is ready"
+                break
+            fi
+            sleep 2
+            elapsed=$((elapsed + 2))
+        done
+
+        if [ $elapsed -ge $timeout ]; then
+            log_error "NVIDIA GPU CRD not available after ${timeout}s"
+            exit 1
+        fi
+
+        # Create operator instances
+        log_info "Creating Node Feature Discovery instance..."
+        oc apply -k "$MANIFESTS_DIR/01-prerequisites/gpu/nfd/instance/"
+        log_info "NFD instance created"
+
+        log_info "Creating NVIDIA GPU ClusterPolicy instance..."
+        oc apply -k "$MANIFESTS_DIR/01-prerequisites/gpu/nvidia-operator/instance/"
+        log_info "GPU ClusterPolicy created"
+
+        # Wait for instances to be ready
+        log_info "Waiting for NFD instance to be ready..."
+        timeout=300
+        elapsed=0
+        while [ $elapsed -lt $timeout ]; do
+            nfd_status=$(oc get nodefeaturediscovery nfd-instance -n openshift-nfd -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "")
+            if [ "$nfd_status" = "True" ]; then
+                log_info "NFD instance is ready"
+                break
+            fi
+            if [ $((elapsed % 30)) -eq 0 ]; then
+                log_info "  Waiting for NFD instance... (${elapsed}/${timeout}s)"
+            fi
+            sleep 5
+            elapsed=$((elapsed + 5))
+        done
+
+        if [ $elapsed -ge $timeout ]; then
+            log_warn "NFD instance did not reach ready state after ${timeout}s"
+            log_warn "This may be normal - continuing with installation"
+        fi
+
+        log_info "Waiting for GPU ClusterPolicy to be ready..."
+        timeout=600
+        elapsed=0
+        while [ $elapsed -lt $timeout ]; do
+            policy_status=$(oc get clusterpolicy gpu-cluster-policy -o jsonpath='{.status.state}' 2>/dev/null || echo "")
+            if [ "$policy_status" = "ready" ]; then
+                log_info "GPU ClusterPolicy is ready"
+                break
+            fi
+            if [ $((elapsed % 30)) -eq 0 ]; then
+                if [ -n "$policy_status" ]; then
+                    log_info "  Waiting for GPU ClusterPolicy... (${elapsed}/${timeout}s, state: ${policy_status})"
+                else
+                    log_info "  Waiting for GPU ClusterPolicy... (${elapsed}/${timeout}s)"
+                fi
+            fi
+            sleep 10
+            elapsed=$((elapsed + 10))
+        done
+
+        if [ $elapsed -ge $timeout ]; then
+            log_warn "GPU ClusterPolicy did not reach ready state after ${timeout}s"
+            log_warn "GPU driver compilation may still be in progress"
+            log_warn "Check status with: oc get pods -n nvidia-gpu-operator"
+        fi
+
+        log_info "GPU operators and instances installation complete"
+    else
+        log_info "Skipping GPU operators (use --include-gpus to install)"
+    fi
+
     # Step 3: MetalLB Detection and Installation
     log_step "Detecting platform type..."
     PLATFORM_TYPE=$(oc get infrastructure cluster -o jsonpath='{.status.platform}')
@@ -459,6 +586,10 @@ if should_run 1; then
     log_info "Phase 1 Completion Summary"
     log_info "========================================="
     log_info "Required operators:    Installed"
+    if [ "$INCLUDE_GPUS" = true ]; then
+        log_info "GPU operators:         Installed"
+        log_info "GPU instances:         Created"
+    fi
     log_info "Platform type:         $PLATFORM_TYPE"
     if [ "$IS_CLOUD_PLATFORM" = false ]; then
         log_info "MetalLB:              Installed"

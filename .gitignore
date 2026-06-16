@@ -63,6 +63,8 @@ db.sqlite3-journal
 
 # Flask stuff:
 instance/
+# But flask stuff confuses operator instances, so ignore them
+!manifests/**/instance/
 .webassets-cache
 
 # Scrapy stuff:
